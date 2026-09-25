@@ -21,7 +21,8 @@ class Row(object):
     """One game as the games screen shows it."""
 
     __slots__ = ("appid", "name", "kind", "installed", "cloud", "saves",
-                 "_launch_options", "wrapped", "tree", "last_played", "index",
+                 "_launch_options", "wrapped", "syncing", "borderless", "tree",
+                 "last_played", "index",
                  "library", "is_game", "catalog_name", "synced")
 
     def __init__(self, appid, name, kind, installed=False, cloud=None,
@@ -55,7 +56,12 @@ class Row(object):
         # Worked out once here: every redraw and every filter asks for both,
         # and each answer means splitting the whole string again.
         self._launch_options = value or ""
+        # wrapped: the launch runs through savepick at all. syncing: it carries
+        # saves. A borderless only game is wrapped and not syncing, and every
+        # question about saves asks `syncing`.
         self.wrapped = wrap.is_wrapped(self._launch_options)
+        self.syncing = wrap.syncs(self._launch_options)
+        self.borderless = wrap.borderless_of(self._launch_options)
         self.tree = wrap.tree_of(self._launch_options)
 
     @property
@@ -65,7 +71,7 @@ class Row(object):
         Unknown cloud support counts as needing it. A game nothing knows about
         is exactly the game whose saves nobody is carrying.
         """
-        if self.wrapped:
+        if self.syncing:
             return False
         if self.cloud is True:
             return False
@@ -106,7 +112,7 @@ class Library(object):
             root = steamdir.find_root()
         if root is None:
             library = cls()
-            library.error = ("No Steam here. Blockslot looked in the usual "
+            library.error = ("No Steam here. BlockSlot looked in the usual "
                              "places and found no userdata folder.")
             return library
         users = steamdir.user_ids(root)
@@ -204,7 +210,7 @@ class Library(object):
         self.rows = sorted(rows.values(), key=Row.sort_key)
         return self.rows
 
-    def attach_backups(self, newest):
+    def attach_backups(self, newest, key=None):
         """Hang the hub's newest backup on each row it can be matched to.
 
         Matched by the manifest name first and the install name second, which
@@ -216,10 +222,17 @@ class Library(object):
         A game with no match is left alone rather than shown as never synced:
         an unmatched name is not evidence of a missing backup.
         """
+        # The store names games by a filesystem-safe key, not by name, so a
+        # store answer passes the function that makes that key.
+        def look(name):
+            if not name:
+                return None
+            return newest.get(key(name) if key else name)
+
         matched = 0
         for row in self.rows:
-            found = (newest.get(row.tree) if row.tree else None) \
-                or newest.get(row.catalog_name) or newest.get(row.name)
+            found = (look(row.tree) if row.tree else None) \
+                or look(row.catalog_name) or look(row.name)
             row.synced = found
             if found:
                 matched += 1
@@ -238,7 +251,7 @@ class Library(object):
                 continue
             if hide_cloud and row.cloud is True and not row.wrapped:
                 continue
-            if only_wrapped and not row.wrapped:
+            if only_wrapped and not row.syncing:
                 continue
             if search and search not in (row.name or "").lower():
                 continue
@@ -247,7 +260,7 @@ class Library(object):
 
     def counts(self):
         total = sum(1 for row in self.rows if row.is_game or row.wrapped)
-        wrapped = sum(1 for row in self.rows if row.wrapped)
+        wrapped = sum(1 for row in self.rows if row.syncing)
         cloud = sum(1 for row in self.rows if row.cloud is True)
         candidates = sum(1 for row in self.rows if row.needs_blockslot)
         return {"total": total, "wrapped": wrapped, "cloud": cloud,
@@ -256,42 +269,80 @@ class Library(object):
     # ------------------------------------------------------------ changing
 
     def plan(self, appids, enable, tree=None):
-        """What would change, without changing anything.
+        """What turning sync on or off would change, without changing anything.
 
         `tree` names a save set for the rows that need one. Only a non-Steam
         shortcut does: a Steam game tells savepick what it is through its app
         id, and giving it a save set as well would point it at another game's
         saves.
 
+        Borderless is left as it is. Turning sync off on a borderless game
+        keeps the wrap, with --no-sync.
+
         Returns (steam_changes, shortcut_changes). The UI shows this before it
         asks to close Steam, because closing Steam is the disruptive part and
         it should never happen for a no-op.
         """
-        engine = paths.engine_path()
-        python = paths.python_for_launch()
-        steam_changes = {}
-        shortcut_changes = []
-        wanted = set(int(appid) for appid in appids)
-        for row in self.rows:
-            if row.appid not in wanted:
-                continue
+        def wanted(row):
             row_tree = row.tree
             if row_tree is None and row.kind == KIND_SHORTCUT:
                 row_tree = tree
-            already = row.wrapped and wrap.engine_of(row.launch_options) == str(engine)
-            if enable and already and row_tree == row.tree:
+            return enable, row.borderless, row_tree
+        return self._plan(appids, wanted)
+
+    def plan_borderless(self, appids, enable):
+        """What turning borderless on or off would change. Sync is left alone."""
+        def wanted(row):
+            return row.syncing, enable, row.tree
+        return self._plan(appids, wanted)
+
+    def _plan(self, appids, wanted):
+        """One plan for both switches. `wanted(row)` -> (sync, borderless, tree).
+
+        The frozen Windows exe carries the engine, so its wraps name the exe
+        with --pick in place of python and savepick.py. Either form written
+        earlier is recognised, and one that is not this install's own is
+        wrapped again in the current form.
+        """
+        if paths.engine_in_exe():
+            python = paths.launch_program()
+            engine = wrap.PICK
+            runs_with = str(python)
+        else:
+            python = paths.python_for_launch()
+            engine = paths.engine_path()
+            runs_with = str(engine)
+        steam_changes = {}
+        shortcut_changes = []
+        picked = set(int(appid) for appid in appids)
+        for row in self.rows:
+            if row.appid not in picked:
+                continue
+            sync, borderless, row_tree = wanted(row)
+            if not sync:
+                row_tree = None
+            enable = sync or borderless
+            entry = (self._shortcut_at(row.index)
+                     if row.kind == KIND_SHORTCUT else None)
+            already = (row.wrapped
+                       and wrap.engine_of(row.launch_options,
+                                          entry.exe if entry else None)
+                       == runs_with
+                       and row.syncing == sync and row.borderless == borderless
+                       and row.tree == row_tree)
+            if enable and already:
                 continue
             if not enable and not row.wrapped:
                 continue
 
             if row.kind == KIND_SHORTCUT:
-                entry = self._shortcut_at(row.index)
                 if entry is None:
                     continue
                 exe, options = wrap.unwrap_shortcut(entry.exe, entry.launch_options)
                 if enable:
                     new_exe, new_options = wrap.build_shortcut(
-                        python, engine, exe, options, tree=row_tree)
+                        python, engine, exe, options, tree=row_tree,
+                        borderless=borderless, sync=sync)
                 else:
                     new_exe, new_options = exe, options
                 shortcut_changes.append((row.index, new_exe, new_options))
@@ -299,7 +350,8 @@ class Library(object):
 
             if enable:
                 current = wrap.strip(row.launch_options)
-                value = wrap.build(python, engine, current, tree=row_tree)
+                value = wrap.build(python, engine, current, tree=row_tree,
+                                   borderless=borderless, sync=sync)
             else:
                 value = wrap.strip(row.launch_options)
             steam_changes[row.appid] = value or None

@@ -13,6 +13,11 @@ Steam launch option:
   Windows: C:/Python313/python.exe C:/Users/you/.local/bin/savepick.py -- %command%
   Linux:   /usr/bin/python3 /home/deck/.local/bin/savepick.py -- %command%
 
+Switches before the `--`:
+  --tree NAME     sync a whole save set instead of one Steam game
+  --borderless    take the frame off the game's window (Windows only)
+  --no-sync       launch without touching saves, for --borderless alone
+
 Fail-safe rule: every failure resolves to "do not restore". A skipped restore
 costs one manual sync. A wrong restore costs hours of play.
 """
@@ -27,7 +32,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +42,7 @@ from pathlib import Path
 # savepick is the name of this file and of the save-picking step. Blockslot is
 # the project it belongs to, and it is the only name worth showing a player, so
 # every window carries it.
-APP_TITLE = "Blockslot"
+APP_TITLE = "BlockSlot"
 
 RESTORE = "restore"
 SKIP = "skip"
@@ -51,7 +58,21 @@ DIALOG_TIMEOUT_SECONDS = 30
 
 METADATA_NAMES = {"mapping.yaml", "registry.yaml"}
 
-LOG_PATH = Path(tempfile.gettempdir()) / "savepick.log"
+def _log_path():
+    """Where the log lives, the same place the Blockslot window reads it.
+
+    Not /tmp on Linux: SteamOS clears it on every restart, and on 2026-09-25
+    a Deck restart two minutes after a DS2 session took that session's log
+    with it. Windows keeps %TEMP% across restarts, so it stays there.
+    """
+    if sys.platform == "win32":
+        return Path(tempfile.gettempdir()) / "savepick.log"
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return Path(base) / "blockslot" / "savepick.log"
+
+
+LOG_PATH = _log_path()
+LOG_ROTATE_BYTES = 2 * 1024 * 1024
 
 # Whether the status window was left showing its log. Written by the window
 # itself, read by the next one, so the choice survives a launch.
@@ -62,6 +83,11 @@ def log(message):
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = "[%s] %s" % (stamp, message)
     try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # A log that outlives restarts has to stop somewhere. One older copy
+        # is kept, which is plenty to read back a bad launch.
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_ROTATE_BYTES:
+            os.replace(str(LOG_PATH), str(LOG_PATH) + ".1")
         with open(LOG_PATH, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
     except OSError:
@@ -426,7 +452,8 @@ def run_powershell_dialog(script, watch_pad=False):
     return None
 
 
-def ask_windows(game, live_text, backup_label, backup_text):
+def ask_windows(game, live_text, backup_label, backup_text, headline=None,
+                keep_label=None, restore_label=None):
     """Two-button dialog worded the same as the Deck's zenity one.
 
     Returns True to restore, False to keep, None on failure. Closing the window
@@ -434,9 +461,10 @@ def ask_windows(game, live_text, backup_label, backup_text):
     """
     script = (WINDOWS_ASK
               .replace("__TITLE__", "%s - Save conflict" % APP_TITLE)
-              .replace("__TEXT__", conflict_text(game, live_text, backup_label, backup_text))
-              .replace("__KEEP__", KEEP_LABEL)
-              .replace("__REST__", RESTORE_LABEL)
+              .replace("__TEXT__", conflict_text(game, live_text, backup_label,
+                                                 backup_text, headline))
+              .replace("__KEEP__", keep_label or KEEP_LABEL)
+              .replace("__REST__", restore_label or RESTORE_LABEL)
               .replace("__TIMEOUT__", str(DIALOG_TIMEOUT_SECONDS)))
     answer = run_powershell_dialog(script, watch_pad=True)
     if answer == "RESTORE":
@@ -496,7 +524,7 @@ def host_env():
     return env
 
 
-def conflict_text(game, live_text, backup_label, backup_text):
+def conflict_text(game, live_text, backup_label, backup_text, headline=None):
     """The wording both platforms show, so every device reads the same.
 
     Both rows are padded to a common width so the two dates start in the same
@@ -505,7 +533,7 @@ def conflict_text(game, live_text, backup_label, backup_text):
     anything: Windows sets Consolas on the label, and zenity_markup() wraps this
     in a <tt> span for the Deck.
     """
-    rows = (("This device:", live_text, "   (newest)"),
+    rows = (("This device:", live_text, "" if headline else "   (newest)"),
             ("%s:" % backup_label, backup_text, ""))
     label_width = max(len(label) for label, _, _ in rows)
     date_width = max(len(date) for _, date, _ in rows)
@@ -515,11 +543,14 @@ def conflict_text(game, live_text, backup_label, backup_text):
     ]
     return (
         "%s\n\n"
-        "The backup is OLDER than the save on this device.\n\n"
+        "%s\n\n"
         "%s\n%s\n\n"
-        "A = keep this device.   B = restore the backup.\n"
-        "Keeping the newest in %d seconds."
-        % (game, lines[0], lines[1], DIALOG_TIMEOUT_SECONDS)
+        "A = keep this device.   B = %s.\n"
+        "Keeping this device in %d seconds."
+        % (game, headline or "The backup is OLDER than the save on this device.",
+           lines[0], lines[1],
+           "use the other save" if headline else "restore the backup",
+           DIALOG_TIMEOUT_SECONDS)
     )
 
 
@@ -528,13 +559,13 @@ def pango_escape(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def zenity_markup(game, live_text, backup_label, backup_text):
+def zenity_markup(game, live_text, backup_label, backup_text, headline=None):
     """The same words as the Windows dialog, in a monospace span.
 
     zenity renders Pango markup by default (it offers --no-markup to turn it
     off), so a game name holding & or < would otherwise break the dialog.
     """
-    body = conflict_text(game, live_text, backup_label, backup_text)
+    body = conflict_text(game, live_text, backup_label, backup_text, headline)
     return "<tt>%s</tt>" % pango_escape(body)
 
 
@@ -914,22 +945,25 @@ def zenity_candidates():
 STARTUP_FAILURES = (126, 127, 255)
 
 
-def ask_linux(game, live_text, backup_label, backup_text):
+def ask_linux(game, live_text, backup_label, backup_text, headline=None,
+              keep_label=None, restore_label=None):
     """Ask on Linux. True to restore, False to keep, None when nothing answered.
 
     Only the extra button restores. Cancel, the window close button and the
     timeout all keep the newest save, so no accident can roll you back.
     """
-    text = conflict_text(game, live_text, backup_label, backup_text)
-    markup = zenity_markup(game, live_text, backup_label, backup_text)
+    text = conflict_text(game, live_text, backup_label, backup_text, headline)
+    markup = zenity_markup(game, live_text, backup_label, backup_text, headline)
+    KEEP = keep_label or KEEP_LABEL
+    REST = restore_label or RESTORE_LABEL
 
     for binary, env in zenity_candidates():
         cmd = [
             binary, "--question", "--title=%s - Save conflict" % APP_TITLE,
             "--text=%s" % markup, "--no-wrap", "--width=640",
-            "--ok-label=%s" % KEEP_LABEL,
+            "--ok-label=%s" % KEEP,
             "--cancel-label=Cancel",
-            "--extra-button=%s" % RESTORE_LABEL,
+            "--extra-button=%s" % REST,
             "--timeout=%d" % DIALOG_TIMEOUT_SECONDS,
         ]
         try:
@@ -943,7 +977,7 @@ def ask_linux(game, live_text, backup_label, backup_text):
         if code == 5:
             log("zenity %s timed out, keeping the newest save" % binary)
             return False
-        if code == 1 and answer == RESTORE_LABEL:
+        if code == 1 and answer == REST:
             return True
         if code in (0, 1):
             return False
@@ -957,7 +991,7 @@ def ask_linux(game, live_text, backup_label, backup_text):
     # asked, so read an answer only when kdialog clearly gave one.
     kdialog = [host_tool("kdialog"), "--title", "%s - Save conflict" % APP_TITLE,
                "--yesno", text,
-               "--yes-label", KEEP_LABEL, "--no-label", RESTORE_LABEL]
+               "--yes-label", KEEP, "--no-label", REST]
     try:
         proc = subprocess.run(kdialog, capture_output=True, text=True, env=host_env(),
                               timeout=DIALOG_TIMEOUT_SECONDS)
@@ -981,13 +1015,13 @@ def read_kdialog(returncode, stderr):
     return None
 
 
-def ask_user(game, live_mtime, backup_label, backup_mtime):
+def ask_user(game, live_mtime, backup_label, backup_mtime, **wording):
     live_text = human_time(live_mtime)
     backup_text = human_time(backup_mtime)
     log("asking: live=%s  %s=%s" % (live_text, backup_label, backup_text))
     if is_windows():
-        return ask_windows(game, live_text, backup_label, backup_text)
-    return ask_linux(game, live_text, backup_label, backup_text)
+        return ask_windows(game, live_text, backup_label, backup_text, **wording)
+    return ask_linux(game, live_text, backup_label, backup_text, **wording)
 
 
 # ---------------------------------------------------------------- exit backup
@@ -1458,8 +1492,105 @@ def peer_dirs(cfg):
             if p.name.casefold() != mine and not p.name.startswith(".")]
 
 
+def hub_connected(cfg):
+    """True when Syncthing has a live connection to the hub."""
+    conns = syncthing_get(cfg, "/rest/system/connections") or {}
+    return bool((conns.get("connections") or {})
+                .get(cfg["hub_id"], {}).get("connected"))
+
+
+REMOTE_NEED_PAGES = 8
+REMOTE_NEED_PER_PAGE = 200
+
+
+def remote_need(cfg, prefix=None):
+    """What the hub still needs, as (items, bytes), or None if unreadable.
+
+    `prefix` limits the answer to one directory, so a backlog somewhere else
+    in the folder cannot hold up this game's confirmation.
+
+    This replaces /rest/db/completion, which cannot be trusted for this.
+    2026-09-21 on the Deck (Syncthing v2.1.2): completion said 99.85% with
+    8.2 MB, 20 items and 28 deletes outstanding, while remoteneed said the hub
+    needed nothing and the hub already held the save on disk. savepick sat at
+    "99%" for its full 180 seconds and then told him NOT SYNCED for a save
+    that had arrived. remoteneed agreed with the disk on both machines.
+    """
+    items = 0
+    total = 0
+    for page in range(1, REMOTE_NEED_PAGES + 1):
+        data = syncthing_get(
+            cfg, "/rest/db/remoteneed?folder=%s&device=%s&page=%d&perpage=%d"
+            % (urllib.parse.quote(cfg["folder"]), cfg["hub_id"],
+               page, REMOTE_NEED_PER_PAGE))
+        if data is None:
+            return None
+        rows = data.get("files")
+        if rows is None:
+            return None
+        for row in rows:
+            name = str(row.get("name") or "").replace("\\", "/")
+            if prefix and not name.startswith(prefix):
+                continue
+            items += 1
+            total += row.get("size") or 0
+        if len(rows) < REMOTE_NEED_PER_PAGE:
+            return items, total
+    # More pages than we will read. Saying "nothing left" from a partial
+    # answer is the one mistake that matters here.
+    log("syncthing: the hub needs more than %d items; not reading further"
+        % (REMOTE_NEED_PAGES * REMOTE_NEED_PER_PAGE))
+    return max(items, 1), total
+
+
+def hub_holds(cfg, rel):
+    """True when Syncthing says the hub holds this exact file.
+
+    Positive proof. "The hub needs nothing" is also true in the moment before
+    the hub has heard about the file at all, so it is never enough on its own.
+    """
+    data = syncthing_get(cfg, "/rest/db/file?folder=%s&file=%s"
+                         % (urllib.parse.quote(cfg["folder"]),
+                            urllib.parse.quote(rel)))
+    if not data:
+        return None
+    for entry in data.get("availability") or []:
+        if entry.get("id") == cfg["hub_id"]:
+            return True
+    return False
+
+
+def newest_backup_file(cfg, game):
+    """One file from this game's newest backup here, relative to the folder.
+
+    One file is enough to prove the hub took the backup, and walking a whole
+    save set to pick a better one would cost more than the wait it guards.
+    """
+    root = folder_root(cfg)
+    name = backup_dir_name(cfg, game) if root is not None else None
+    if not name:
+        return None
+    mine = root / (cfg.get("device_dir") or "") / name
+    try:
+        backups = sorted(p for p in mine.iterdir()
+                         if p.is_dir() and p.name.startswith("backup-"))
+    except OSError:
+        return None
+    if not backups:
+        return None
+    for dirpath, _dirs, files in os.walk(str(backups[-1])):
+        for entry in sorted(files):
+            full = Path(dirpath) / entry
+            return str(full.relative_to(root)).replace(os.sep, "/")
+    return None
+
+
 def sync_progress(cfg):
-    """(percent, connected) for the hub, or (None, None) if it cannot be read."""
+    """(percent, connected) for the hub, or (None, None) if it cannot be read.
+
+    The fallback for a Syncthing with no /rest/db/remoteneed. The percentage
+    is of the WHOLE folder, so one save is a rounding error in it.
+    """
     comp = syncthing_get(cfg, "/rest/db/completion?folder=%s&device=%s"
                          % (cfg["folder"], cfg["hub_id"]))
     if comp is None:
@@ -1467,43 +1598,108 @@ def sync_progress(cfg):
     percent = int(comp.get("completion") or 0)
     if (comp.get("needBytes") or 0) > 0:
         percent = min(percent, 99)
-    conns = syncthing_get(cfg, "/rest/system/connections") or {}
-    connected = bool((conns.get("connections") or {})
-                     .get(cfg["hub_id"], {}).get("connected"))
-    return percent, connected
+    return percent, hub_connected(cfg)
 
 
-def wait_for_sync(spinner):
-    """Wait until the server really holds the new backup.
+def wait_for_sync(spinner, game=None):
+    """Wait until the hub really holds the backup that just ran.
 
-    True when the hub reaches 100 percent. False when it does not get there in
-    time. None when there are no Syncthing settings, so there is nothing to
-    wait for.
+    True when Syncthing says the hub has it. False when it does not get there
+    in time or the hub goes offline. None when there are no Syncthing
+    settings, so there is nothing to wait for.
 
-    The hub is always on, so unlike the old device-to-device wait this one is
-    normally satisfied. A failure here means the server is unreachable, which
-    is worth a warning.
+    Two questions, and both have to answer yes:
+
+      the hub HOLDS a file from this backup   (positive proof)
+      the hub NEEDS nothing else from it      (nothing still queued)
+
+    The first alone would pass while the rest of a save set is still moving.
+    The second alone would pass in the moment before the hub has even heard
+    of the backup. Neither is asked of /rest/db/completion any more, because
+    that number lied on the Deck: see remote_need().
     """
     cfg = sync_settings()
     if cfg is None:
         log("no syncthing settings; not waiting for the server")
         return None
     hub = hub_label(cfg)
+    prefix = None
+    sample = None
+    if game:
+        name = backup_dir_name(cfg, game)
+        if name:
+            prefix = "%s/%s/" % (cfg.get("device_dir") or "", name)
+        sample = newest_backup_file(cfg, game)
+        if sample is None:
+            log("syncthing: no backup file to track for %s" % game)
     started = time.monotonic()
+    biggest = 0
     shown = None
+    holds = False
+    while time.monotonic() - started < SYNC_WAIT_SECONDS:
+        need = remote_need(cfg, prefix)
+        if need is None:
+            return wait_for_sync_by_completion(spinner, cfg, hub, started, shown)
+        items, bytes_left = need
+
+        if sample is not None and not holds:
+            answer = hub_holds(cfg, sample)
+            if answer is None:
+                return wait_for_sync_by_completion(spinner, cfg, hub, started, shown)
+            holds = answer
+
+        if items == 0 and (holds or sample is None):
+            log("syncthing: %s has the backup" % hub)
+            spinner.update("%s has your save." % hub, 100)
+            return True
+
+        if not hub_connected(cfg) and time.monotonic() - started > SYNC_OFFLINE_GRACE:
+            log("syncthing: %s went offline with %d item(s) left" % (hub, items))
+            return False
+
+        # The bar measures THIS backup, not the 5.6 GB folder around it.
+        # Against the folder, one save moved the number by a hundredth of a
+        # percent and the window read 99% from the first second.
+        biggest = max(biggest, bytes_left)
+        if biggest > 0:
+            percent = max(0, min(99, int(100.0 * (biggest - bytes_left) / biggest)))
+            text = ("Sending to %s ... %d%% (%s to go)"
+                    % (hub, percent, human_bytes(bytes_left)))
+        elif items > 0:
+            percent = None
+            text = "Sending %d item(s) to %s ..." % (items, hub)
+        else:
+            percent = None
+            text = "Waiting for %s to confirm ..." % hub
+        if text != shown:
+            log("syncthing: %s" % text)
+            shown = text
+        spinner.update(text, percent)
+        time.sleep(1.5)
+    log("syncthing: gave up waiting for %s" % hub)
+    return False
+
+
+def wait_for_sync_by_completion(spinner, cfg, hub, started, shown):
+    """The old folder-completion wait, for a Syncthing without remoteneed.
+
+    It cannot tell this game's bytes from the folder's, so its percentage is
+    of the whole folder. It is a fallback and nothing else.
+    """
+    log("syncthing: no remoteneed answer; falling back to folder completion")
     while time.monotonic() - started < SYNC_WAIT_SECONDS:
         percent, connected = sync_progress(cfg)
         if percent is None:
             return None
         if percent >= 100:
             log("syncthing: %s is up to date" % hub)
-            spinner.update("%s has your save." % hub)
+            spinner.update("%s has your save." % hub, 100)
             return True
         if not connected and time.monotonic() - started > SYNC_OFFLINE_GRACE:
             log("syncthing: %s is offline at %d%%" % (hub, percent))
             return False
         if percent != shown:
-            spinner.update("Sending to %s ... %d%%" % (hub, percent))
+            spinner.update("Sending to %s ... %d%%" % (hub, percent), percent)
             shown = percent
         time.sleep(1.5)
     log("syncthing: gave up waiting for %s" % hub)
@@ -1614,6 +1810,9 @@ class SpinnerOrPadCancel:
 
 SYNC_POLL_SECONDS = 1.5
 SYNC_SETTLE_SECONDS = 6.0
+# The settle window is the one part of the wait whose length is known, so the
+# bar fills across it. It is redrawn faster than the poll interval for that.
+SETTLE_TICK_SECONDS = 0.25
 SYNC_MISS_LIMIT = 5
 SCAN_POKE_TIMEOUT = 3
 # Syncthing retries a failed pull about once a minute. Give its own retry a
@@ -1660,18 +1859,177 @@ def sync_percent(status):
     return max(0, min(100, int(round(100.0 * (total - need) / total))))
 
 
-def poke_syncthing(cfg):
-    """Ask Syncthing to look now, rather than waiting for its own schedule."""
+def human_bytes(count):
+    """A byte count a player can read. Never more than one decimal place."""
+    value = float(count or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return "%d B" % int(value)
+            return "%.1f %s" % (value, unit)
+        value /= 1024.0
+
+
+def wait_message(status, hub):
+    """What the window says about one status, and how full the bar is.
+
+    Returns (text, percent). A percent of None means there is nothing real to
+    measure, so the bar pulses instead of claiming a number.
+
+    The old text said "Getting saves from <hub> ... 100%" for a whole 51
+    second scan, because the percent counts BYTES left to transfer and there
+    were none left. One line, one number, and both of them true, for a window
+    that was not waiting on a transfer at all. It read as a hang.
+
+    So the state Syncthing reports is what the window says it is waiting for.
+    """
+    status = status or {}
+    need_bytes = status.get("needBytes") or 0
+    need_items = status.get("needTotalItems") or 0
+    state = status.get("state") or "unknown"
+    if need_bytes > 0:
+        # 7.9 MB left of 5.6 GB rounds to 100, and "100% (7.9 MB to go)" is a
+        # sentence that argues with itself. Seen on the Deck 2026-09-21.
+        # Nothing left to copy is the only thing allowed to say 100.
+        percent = min(sync_percent(status), 99)
+        return ("Copying saves from %s, %d%% (%s to go)"
+                % (hub, percent, human_bytes(need_bytes)), percent)
+    if need_items > 0:
+        # Deletes and directories weigh nothing, so there is no percentage to
+        # show here. 2026-09-10: a prune of two old backups was exactly this.
+        return ("Applying %d change(s) from %s ..." % (need_items, hub), None)
+    if state == "scanning":
+        return ("Nothing to copy from %s. Checking this device's files ..." % hub,
+                None)
+    if state == "syncing":
+        return ("Finishing up with %s ..." % hub, None)
+    return ("Checking with %s (%s) ..." % (hub, state), None)
+
+
+def settle_percent(waited, settle):
+    """How full the bar is through the settle window, 0 to 100."""
+    if settle <= 0:
+        return 100
+    return max(0, min(100, int(round(100.0 * waited / settle))))
+
+
+def backup_dir_name(cfg, game):
+    """The directory ludusavi keeps one game in, asked of ludusavi itself.
+
+    The name is the same under every device directory, because ludusavi builds
+    it from the game's own name. It is never built here: ludusavi rewrites the
+    characters a filesystem refuses, which is why the hub holds
+    "Dark Souls II_ Scholar of the First Sin".
+
+    This device is asked first, then each peer, because a game played only on
+    another device has no backup directory here to name.
+    """
+    lookups = [[]]
+    lookups.extend(["--path", str(peer)] for peer in peer_dirs(cfg))
+    for extra in lookups:
+        data = run_json(["--no-manifest-update", "backups", "--api"]
+                        + list(extra) + [game])
+        entry = ((data or {}).get("games") or {}).get(game) or {}
+        path = (entry.get("backupPath") or "").replace("\\", "/").rstrip("/")
+        if path:
+            return path.rsplit("/", 1)[-1]
+    return None
+
+
+def scan_subs(cfg, game, devices=None):
+    """The paths a scan has to cover for one game, relative to the folder.
+
+    `devices` names the device directories to cover. The default is this
+    device's own, which is the only one anything here ever writes to: ludusavi
+    writes a backup and prunes old ones, both inside it and both at exit.
+    Every other device's directory is written by Syncthing itself, and
+    Syncthing indexes what it writes.
+
+    Scanning the whole folder cost 51.6 seconds on the Windows PC on
+    2026-09-21 with nothing to transfer and nothing changed: 28,889 files and
+    14,087 directories, every retained backup of every game for every device.
+    Measured the same day for one game across two device directories: 0.5
+    seconds for Dark Souls II, 41 seconds for the RetroBat save set, which
+    holds 4,696 files per backup. Half of that 41 seconds was the peer's
+    directory, which no scan here can ever learn anything about.
+
+    An empty list means there is nothing of this game to scan.
+    """
+    root = folder_root(cfg)
+    if root is None:
+        return []
+    name = backup_dir_name(cfg, game)
+    if not name:
+        log("syncthing: ludusavi names no backup directory for %s; no scan" % game)
+        return []
+    if devices is None:
+        devices = [cfg.get("device_dir") or ""]
+    wanted = {str(d).casefold() for d in devices if d}
+    try:
+        here = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError as exc:
+        log("cannot read the shared folder: %s" % exc)
+        return []
+    # Anything starting with a dot is Syncthing's own (.stfolder,
+    # .stversions). It is never a device and is never scanned as one.
+    return ["%s/%s" % (d.name, name) for d in here
+            if not d.name.startswith(".")
+            and d.name.casefold() in wanted and (d / name).is_dir()]
+
+
+SCAN_WAIT_SECONDS = 120.0
+
+
+def wait_for_scan(cfg, spinner=None, poll=SYNC_POLL_SECONDS,
+                  limit=SCAN_WAIT_SECONDS):
+    """Wait until Syncthing has finished looking at what just changed.
+
+    True when the folder went idle, False when it did not in time.
+
+    /rest/db/completion answers from the index, not from the disk. A backup
+    written seconds ago is not in the index yet, so the hub needs nothing of
+    it and the exit wait would call that done. It is not done. It has not been
+    seen. So the scan is asked for and waited out before the hub is asked
+    anything.
+    """
+    folder = cfg["folder"]
+    started = time.monotonic()
+    while time.monotonic() - started < limit:
+        status = syncthing_get(cfg, "/rest/db/status?folder=%s" % folder)
+        if status is None:
+            return False
+        if status.get("state") == "idle":
+            return True
+        if spinner is not None:
+            spinner.update("Adding your save to %s ..." % folder, None)
+        time.sleep(poll)
+    log("syncthing: %s is still scanning after %.0fs; carrying on" % (folder, limit))
+    return False
+
+
+def poke_syncthing(cfg, subs=None):
+    """Ask Syncthing to look now, rather than waiting for its own schedule.
+
+    `subs` names the folder paths to scan. None scans the whole folder, which
+    is a minute or more on a hub this size. An empty list scans nothing.
+    """
     folder = cfg["folder"]
     syncthing_post(cfg, "/rest/system/resume?device=%s" % cfg["hub_id"])
     folder_cfg = syncthing_get(cfg, "/rest/config/folders/%s" % folder)
     if folder_cfg and folder_cfg.get("paused"):
         log("syncthing: %s is paused; resuming it" % folder)
         syncthing_patch(cfg, "/rest/config/folders/%s" % folder, {"paused": False})
-    # /rest/db/scan is synchronous and a full folder scan can take longer than
-    # the request. The scan carries on server-side, so a short timeout here is
-    # the poke we wanted, not a failure.
-    syncthing_post(cfg, "/rest/db/scan?folder=%s" % folder, timeout=SCAN_POKE_TIMEOUT)
+    if subs is not None and not subs:
+        # Asked for explicitly. The caller says what it means by it.
+        return
+    query = "/rest/db/scan?folder=%s" % urllib.parse.quote(folder)
+    if subs:
+        query += "".join("&sub=%s" % urllib.parse.quote(sub) for sub in subs)
+        log("syncthing: scanning %s" % ", ".join(subs))
+    # /rest/db/scan is synchronous and a scan can take longer than the request.
+    # The scan carries on server-side, so a short timeout here is the poke we
+    # wanted, not a failure.
+    syncthing_post(cfg, query, timeout=SCAN_POKE_TIMEOUT)
 
 
 def wait_for_incoming(spinner=None, cancel=None,
@@ -1695,7 +2053,12 @@ def wait_for_incoming(spinner=None, cancel=None,
         return None
     hub = hub_label(cfg)
     folder = cfg["folder"]
-    poke_syncthing(cfg)
+    # No scan before a launch. Nothing on this device writes to the shared
+    # folder except the exit backup, which scans its own directory when it
+    # runs. Every peer directory here is written by Syncthing and indexed by
+    # Syncthing. A scan could not change one answer below, and asking for the
+    # whole folder was the entire 51 to 126 second wait he was looking at.
+    poke_syncthing(cfg, [])
 
     connected_since = None
     ready_since = None
@@ -1723,13 +2086,13 @@ def wait_for_incoming(spinner=None, cancel=None,
                     log("syncthing: waiting for %s to connect" % hub)
                     shown = "offline"
                 if spinner is not None:
-                    spinner.update("Waiting for %s to connect ..." % hub)
+                    spinner.update("Waiting for %s to connect ..." % hub, None)
                 time.sleep(poll)
                 continue
             connected_since = time.monotonic()
             log("syncthing: %s is connected" % hub)
             if spinner is not None:
-                spinner.update("Checking %s for new saves ..." % hub)
+                spinner.update("Checking %s for new saves ..." % hub, None)
             # Never judge the folder on the same pass that saw the connection.
             time.sleep(poll)
             continue
@@ -1774,9 +2137,10 @@ def wait_for_incoming(spinner=None, cancel=None,
                     "waiting for its retry" % (folder, errors))
                 shown = ("errors", errors)
             if spinner is not None:
-                spinner.update("%s is retrying %d item(s) ...\n"
+                waited = int(time.monotonic() - errors_since)
+                spinner.update("%s is retrying %d item(s), %ds of %ds ...\n"
                                "B or Cancel plays on this device now."
-                               % (hub, errors))
+                               % (hub, errors, waited, int(heal_after)), None)
             if time.monotonic() - errors_since >= heal_after:
                 log("syncthing: %s is still stuck after %.0fs; "
                     "launching on the save already here" % (folder, heal_after))
@@ -1788,19 +2152,28 @@ def wait_for_incoming(spinner=None, cancel=None,
         if incoming_ready(status):
             if ready_since is None:
                 ready_since = time.monotonic()
-            if time.monotonic() - ready_since >= settle:
+            waited = time.monotonic() - ready_since
+            if waited >= settle:
                 log("syncthing: %s is current with %s" % (folder, hub))
                 if spinner is not None:
-                    spinner.update("Up to date with %s." % hub)
+                    spinner.update("Up to date with %s." % hub, 100)
                 return True
-        else:
-            ready_since = None
-            percent = sync_percent(status)
-            if percent != shown:
-                log("syncthing: getting saves from %s, %d%%" % (hub, percent))
-                shown = percent
             if spinner is not None:
-                spinner.update("Getting saves from %s ... %d%%" % (hub, percent))
+                # The one wait that is always the same length, so the bar can
+                # show it filling rather than pulse at nothing.
+                spinner.update("Up to date with %s. Making sure, %ds ..."
+                               % (hub, max(1, int(round(settle - waited)))),
+                               settle_percent(waited, settle))
+            time.sleep(min(poll, SETTLE_TICK_SECONDS))
+            continue
+
+        ready_since = None
+        text, percent = wait_message(status, hub)
+        if text != shown:
+            log("syncthing: %s" % text)
+            shown = text
+        if spinner is not None:
+            spinner.update(text, percent)
         time.sleep(poll)
 
 
@@ -1812,6 +2185,11 @@ def wait_for_incoming(spinner=None, cancel=None,
 WINDOWS_SPINNER = r'''
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+# A Marquee progress bar is drawn by comctl32 v6 and by nothing else. Without
+# this line WinForms falls back to the classic control, which draws the bar as
+# an empty box and never animates it. That is what the window had been doing:
+# a minute of real work behind a bar that looked broken.
+[System.Windows.Forms.Application]::EnableVisualStyles()
 $ErrorActionPreference = "SilentlyContinue"
 
 $statusFile = "__STATUS__"
@@ -1834,9 +2212,22 @@ $label.Location = New-Object System.Drawing.Point(20,22)
 $label.Size = New-Object System.Drawing.Size(545,40)
 $form.Controls.Add($label)
 
+# A Marquee bar is drawn by comctl32 v6 and by nothing else. Where visual
+# styles are off it degrades to an empty box that never moves, which is what
+# his window had been showing for a minute at a time. Measured on the Windows
+# PC 2026-09-21: RenderWithVisualStyles is False there even after asking for
+# them. So where the marquee cannot animate, the bar is swept by hand.
+$script:canMarquee = [System.Windows.Forms.Application]::RenderWithVisualStyles
+$script:pulseValue = 0
 $bar = New-Object System.Windows.Forms.ProgressBar
-$bar.Style = "Marquee"
-$bar.MarqueeAnimationSpeed = 30
+$bar.Minimum = 0
+$bar.Maximum = 100
+if ($script:canMarquee) {
+  $bar.Style = "Marquee"
+  $bar.MarqueeAnimationSpeed = 30
+} else {
+  $bar.Style = "Continuous"
+}
 $bar.Location = New-Object System.Drawing.Point(20,72)
 $bar.Size = New-Object System.Drawing.Size(545,24)
 $form.Controls.Add($bar)
@@ -1898,11 +2289,43 @@ $details.Add_Click({
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 300
+# Every status line ends in "|<percent>", or "|-" for a bar that pulses.
+# A line that does not match is a half-written file, so the window keeps what
+# it has rather than flickering the bar back to pulsing for one tick.
 $timer.Add_Tick({
   if (Test-Path $statusFile) {
     $line = (Get-Content $statusFile -Raw)
     if ($line -match "__DONE__") { $timer.Stop(); $form.Close(); return }
-    elseif ($line) { $label.Text = $line.Trim() }
+    elseif ($line -match "^(.*)\|(-|\d{1,3})\s*$") {
+      $label.Text = $matches[1].Trim()
+      $pct = $matches[2]
+      if ($pct -eq "-") {
+        if ($script:canMarquee) {
+          if ($bar.Style -ne "Marquee") {
+            $bar.Style = "Marquee"
+            $bar.MarqueeAnimationSpeed = 30
+          }
+        } else {
+          # One sweep every four seconds. It says "still working" without
+          # claiming a number savepick does not have.
+          if ($bar.Style -ne "Continuous") { $bar.Style = "Continuous" }
+          $script:pulseValue = ($script:pulseValue + 8) % 104
+          $bar.Value = [Math]::Min(100, $script:pulseValue)
+        }
+      } else {
+        if ($bar.Style -ne "Continuous") {
+          $bar.MarqueeAnimationSpeed = 0
+          $bar.Style = "Continuous"
+        }
+        $value = [Math]::Min(100, [int]$pct)
+        # Windows animates a progress bar TOWARDS its value, so a bar told to
+        # jump is still crawling when the window closes. Overshooting by one
+        # and coming back lands it at once.
+        if ($value -lt 100) { $bar.Value = $value + 1 }
+        else { $bar.Value = 100 }
+        $bar.Value = $value
+      }
+    }
   }
   Sync-Log
 })
@@ -1923,6 +2346,15 @@ $cancel.Add_Click({ $timer.Stop(); $form.Close() })
 $form.Controls.Add($cancel)
 $form.CancelButton = $cancel
 '''
+
+
+def status_line(text, percent):
+    """One line the window can parse: the text, then the bar position.
+
+    A percent of None means the bar pulses. Anything else fills it.
+    """
+    mark = "-" if percent is None else str(max(0, min(100, int(percent))))
+    return "%s|%s" % (text.replace("\n", " "), mark)
 
 
 def ps_path(path):
@@ -1972,7 +2404,7 @@ class Spinner:
     def _start_windows(self, title, text):
         status = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
                                              encoding="ascii", errors="replace")
-        status.write(text)
+        status.write(status_line(text, None))
         status.close()
         self._status = status.name
         script = tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False,
@@ -1992,12 +2424,17 @@ class Spinner:
              "-File", self._script],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **no_window())
 
-    def update(self, text):
+    def update(self, text, percent=None):
+        """Say what is happening, and how full the bar is.
+
+        percent None pulses the bar, which is the honest answer whenever
+        Syncthing has given no number to show.
+        """
         line = text.replace("\n", " ")
         if self._status:
             try:
                 with open(self._status, "w", encoding="ascii", errors="replace") as handle:
-                    handle.write(line)
+                    handle.write(status_line(line, percent))
             except OSError:
                 pass
             return
@@ -2139,8 +2576,21 @@ def backup_on_exit(game):
                        "another device until this is sorted out." % game)
             return
 
-        hub = hub_label(sync_settings() or {})
-        result = wait_for_sync(spinner)
+        cfg = sync_settings()
+        hub = hub_label(cfg or {})
+        if cfg:
+            # ludusavi has just written a backup and may have pruned an old
+            # one. Ask Syncthing to look at that directory, and wait for it,
+            # before asking whether the hub has the save: the hub is asked
+            # from the index, and what has not been scanned is not in it.
+            subs = scan_subs(cfg, game)
+            if subs:
+                spinner.update("Adding your save to the sync folder ...", None)
+                poke_syncthing(cfg, subs)
+                wait_for_scan(cfg, spinner)
+            else:
+                log("syncthing: nothing of %s in the shared folder here" % game)
+        result = wait_for_sync(spinner, game)
         if result is True:
             spinner.update("Done. %s has this session." % hub)
             time.sleep(2)
@@ -2411,6 +2861,529 @@ CHILD = None
 SIGNALS_SEEN = []
 # One monotonic time, set when the first stop signal goes out.
 STOP_DEADLINE = []
+# Set by main from --borderless: hold the game's window borderless.
+BORDERLESS = False
+
+
+# ------------------------------------------------------------- the foreground
+# Windows hands the foreground to whoever had it last, and savepick is started
+# by Steam rather than by a click, so the game opens BEHIND Steam and he
+# alt-tabs to it every time.
+#
+# SetForegroundWindow on its own is refused and returns success while doing
+# nothing, which is the same trap as [[windows-screen-capture]]. What lifts
+# the lock is AttachThreadInput: with this process's input queue attached to
+# the foreground window's thread, this process counts as the foreground one
+# and the call is honoured.
+#
+# The game is not always the process savepick started. RetroBat starts its
+# own frontend, and the shadPS4 launcher is a python script. So the whole
+# process tree under the child is eligible.
+FOCUS_DEADLINE_SECONDS = 40.0
+FOCUS_POLL_SECONDS = 0.5
+FOCUS_SETTLE_SECONDS = 1.0
+
+
+def process_tree(root_pid, parents):
+    """root_pid and every process descended from it, from a {pid: parent} map.
+
+    A game that launches through a wrapper is two or three processes deep, and
+    only the last one owns a window.
+    """
+    tree = {root_pid}
+    # A parent map can hold a cycle after pid reuse. Walking it a bounded
+    # number of times cannot hang, and one pass per process is plenty.
+    for _round in range(len(parents) + 1):
+        grew = False
+        for pid, parent in parents.items():
+            if parent in tree and pid not in tree:
+                tree.add(pid)
+                grew = True
+        if not grew:
+            break
+    return tree
+
+
+def choose_window(windows, pids):
+    """The window to raise, from (hwnd, pid, owner, title, visible) tuples.
+
+    An owned window is a dialog or a tooltip, and a window with no title is
+    usually a message-only helper. Neither is what a player is looking at.
+    """
+    for hwnd, pid, owner, title, visible in windows:
+        if pid in pids and visible and not owner and (title or "").strip():
+            return hwnd
+    return None
+
+
+def windows_process_parents():
+    """{pid: parent pid} for every running process, or {} if it cannot be read."""
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class ENTRY(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260)]
+
+    kernel32 = ctypes.windll.kernel32
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if snap == -1:
+        return {}
+    parents = {}
+    try:
+        entry = ENTRY()
+        entry.dwSize = ctypes.sizeof(ENTRY)
+        ok = kernel32.Process32First(snap, ctypes.byref(entry))
+        while ok:
+            parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            ok = kernel32.Process32Next(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return parents
+
+
+def windows_top_level_windows():
+    """Every top level window, as choose_window wants them."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    found = []
+
+    def keep(hwnd, _param):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        length = user32.GetWindowTextLengthW(hwnd)
+        title = ""
+        if length:
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+        found.append((hwnd, int(pid.value),
+                      int(user32.GetWindow(hwnd, 4) or 0),  # GW_OWNER
+                      title, bool(user32.IsWindowVisible(hwnd))))
+        return True
+
+    proto = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows(proto(keep), 0)
+    return found
+
+
+def windows_raise(hwnd):
+    """Put one window in front, past the foreground lock. True if it took."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    SW_RESTORE = 9
+
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    front = user32.GetForegroundWindow()
+    ours = user32.GetWindowThreadProcessId(hwnd, None)
+    theirs = user32.GetWindowThreadProcessId(front, None) if front else 0
+    mine = kernel32.GetCurrentThreadId()
+    attached = []
+    for thread in (theirs, ours):
+        if thread and thread != mine and user32.AttachThreadInput(mine, thread, True):
+            attached.append(thread)
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        for thread in attached:
+            user32.AttachThreadInput(mine, thread, False)
+    return bool(user32.GetForegroundWindow() == hwnd)
+
+
+def linux_process_parents():
+    """{pid: parent pid} from /proc, or {} when it cannot be read."""
+    parents = {}
+    for entry in glob.glob("/proc/[0-9]*/stat"):
+        try:
+            with open(entry, "r") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        # The command name sits in brackets and can hold spaces and brackets
+        # of its own, so the fields after it are counted from the LAST ')'.
+        close = text.rfind(")")
+        if close < 0:
+            continue
+        fields = text[close + 2:].split()
+        if len(fields) < 2:
+            continue
+        try:
+            parents[int(text[:text.index(" ")])] = int(fields[1])
+        except ValueError:
+            continue
+    return parents
+
+
+def linux_window_ids(pids, run=None):
+    """Window ids owned by these processes, newest last, from xdotool.
+
+    xdotool finds a window by its _NET_WM_PID. A game that does not set it is
+    invisible here, which is why nothing below treats an empty answer as a
+    failure worth reporting twice.
+    """
+    runner = run or (lambda cmd: subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10, env=host_env()))
+    found = []
+    for pid in sorted(pids):
+        try:
+            done = runner([host_tool("xdotool"), "search", "--onlyvisible",
+                           "--pid", str(pid)])
+        except (OSError, subprocess.SubprocessError):
+            return []
+        for line in (done.stdout or "").split():
+            if line.strip().isdigit():
+                found.append(line.strip())
+    return found
+
+
+def linux_focus_is_ours(run=None):
+    """False when the compositor does not publish which window is active.
+
+    gamescope does not. It chooses the focused window itself, from what Steam
+    tells it, and there is nothing here to reinforce. Measured on the Deck
+    2026-09-21, on both :0 and :1:
+
+        xdotool getactivewindow
+        XGetWindowProperty[_NET_ACTIVE_WINDOW] failed (code=1)
+
+    A desktop session answers it, so Desktop Mode still gets the raise. Game
+    Mode stops here rather than retrying for forty seconds and then logging a
+    failure that was never savepick's to have.
+    """
+    runner = run or (lambda cmd: subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10, env=host_env()))
+    try:
+        done = runner([host_tool("xdotool"), "getactivewindow"])
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (done.stdout or "").strip().isdigit()
+
+
+def linux_raise(window_id, run=None):
+    """Ask the window manager to activate one window. True if it took.
+
+    Under gamescope this may be ignored outright: gamescope picks the focused
+    window itself and Steam tells it which app is in front. That is fine. The
+    call costs nothing and the log says what happened.
+    """
+    runner = run or (lambda cmd: subprocess.run(
+        cmd, capture_output=True, text=True, timeout=10, env=host_env()))
+    tool = host_tool("xdotool")
+    try:
+        runner([tool, "windowactivate", "--sync", window_id])
+        done = runner([tool, "getactivewindow"])
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return (done.stdout or "").strip() == str(window_id)
+
+
+def focus_the_game(pid, deadline=FOCUS_DEADLINE_SECONDS,
+                   poll=FOCUS_POLL_SECONDS, settle=FOCUS_SETTLE_SECONDS):
+    """Raise the game's window once it exists. Never raises, never blocks a launch.
+
+    It gives up the moment it succeeds, so a player who alt-tabs away a second
+    later keeps what they chose. Everything here is best effort: a game that
+    never opens a window, or a window this cannot reach, costs nothing but the
+    deadline.
+    """
+    if not is_windows() and not os.environ.get("DISPLAY"):
+        return False
+    started = time.monotonic()
+    time.sleep(settle)
+    while time.monotonic() - started < deadline:
+        try:
+            if is_windows():
+                pids = process_tree(pid, windows_process_parents())
+                target = choose_window(windows_top_level_windows(), pids)
+                raised = bool(target) and windows_raise(target)
+            else:
+                if not linux_focus_is_ours():
+                    log("focus: the compositor owns the focus here; "
+                        "leaving it alone")
+                    return False
+                pids = process_tree(pid, linux_process_parents())
+                ids = linux_window_ids(pids)
+                target = ids[-1] if ids else None
+                raised = bool(target) and linux_raise(target)
+            if raised:
+                log("focus: raised the game's window")
+                return True
+        except Exception as exc:
+            log("focus: gave up (%s)" % exc)
+            return False
+        time.sleep(poll)
+    log("focus: no window of the game took the foreground in %.0fs" % deadline)
+    return False
+
+
+def watch_for_the_game_window(proc):
+    """Run focus_the_game beside the game, never in front of it."""
+    pid = getattr(proc, "pid", None)
+    if not pid or (not is_windows() and not os.environ.get("DISPLAY")):
+        return None
+    thread = threading.Thread(target=focus_the_game, args=(pid,), daemon=True)
+    thread.start()
+    return thread
+
+
+# ---------------------------------------------------------------- borderless
+#
+# A game like Dark Souls II offers exclusive fullscreen or a window with a title
+# bar, and no borderless mode. --borderless takes the frame off the game's
+# window and fits it to the monitor it is on. The game must be set to windowed
+# in its own options; an exclusive fullscreen game has no frame to take off.
+#
+# It is independent of save sync. --no-sync runs a game through here for this
+# alone, so a game Steam Cloud already covers never has its saves touched.
+#
+# Windows only. gamescope already shows every game fullscreen on the Deck.
+#
+# The watch lasts as long as the game. A launcher or splash window can come
+# first, and some games put their frame back after a resolution change, so a
+# window that has its frame again gets it taken off again.
+BORDERLESS_POLL_SECONDS = 2.0
+BORDERLESS_SETTLE_SECONDS = 1.0
+
+WS_CAPTION = 0x00C00000
+WS_THICKFRAME = 0x00040000
+WS_MINIMIZEBOX = 0x00020000
+WS_MAXIMIZEBOX = 0x00010000
+WS_SYSMENU = 0x00080000
+WS_FRAME_BITS = (WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX
+                 | WS_MAXIMIZEBOX | WS_SYSMENU)
+WS_EX_DLGMODALFRAME = 0x00000001
+WS_EX_WINDOWEDGE = 0x00000100
+WS_EX_CLIENTEDGE = 0x00000200
+WS_EX_STATICEDGE = 0x00020000
+WS_EX_FRAME_BITS = (WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE
+                    | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE)
+
+
+def borderless_style(style, ex_style):
+    """The window style with every part of the frame taken off."""
+    return style & ~WS_FRAME_BITS, ex_style & ~WS_EX_FRAME_BITS
+
+
+def is_borderless(style, ex_style, rect, monitor):
+    """True when there is no frame left and the window covers its monitor."""
+    return (not (style & WS_FRAME_BITS) and not (ex_style & WS_EX_FRAME_BITS)
+            and tuple(rect) == tuple(monitor))
+
+
+def choose_game_window(windows, pids, area):
+    """The biggest window choose_window would accept, or None.
+
+    A game can own a small window beside its main one (a crash reporter, an
+    overlay), and the biggest is the one being played. `area(hwnd)` is a seam
+    so a test can say how big each window is.
+    """
+    best = None
+    best_area = -1
+    for hwnd, pid, owner, title, visible in windows:
+        if pid in pids and visible and not owner and (title or "").strip():
+            size = area(hwnd)
+            if size > best_area:
+                best, best_area = hwnd, size
+    return best
+
+
+def _user32_for_borderless():
+    """user32 with the pointer sized calls typed, so 64 bit styles survive."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    for name in ("GetWindowLongPtrW", "SetWindowLongPtrW"):
+        func = getattr(user32, name, None)
+        if func is None:
+            continue
+        func.restype = ctypes.c_ssize_t
+        if name == "GetWindowLongPtrW":
+            func.argtypes = [wintypes.HWND, ctypes.c_int]
+        else:
+            func.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    return user32
+
+
+def windows_dpi_aware():
+    """Ask for real pixels on this thread, never scaled ones.
+
+    Without it, a 150 percent display reports its monitor as two thirds of
+    its size, and the game is fitted to a rectangle that is too small.
+    """
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        if user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return True
+    except AttributeError:
+        pass
+    try:
+        return bool(user32.SetProcessDPIAware())
+    except AttributeError:
+        return False
+
+
+def windows_window_rect(hwnd):
+    import ctypes
+    from ctypes import wintypes
+
+    rect = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return (rect.left, rect.top, rect.right, rect.bottom)
+
+
+def windows_monitor_rect(hwnd):
+    """The whole monitor the window is mostly on, taskbar included."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    user32 = ctypes.windll.user32
+    user32.MonitorFromWindow.restype = ctypes.c_void_p
+    user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    monitor = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+    if not monitor:
+        return None
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return None
+    r = info.rcMonitor
+    return (r.left, r.top, r.right, r.bottom)
+
+
+def windows_make_borderless(hwnd):
+    """Take the frame off one window and fit it to its monitor.
+
+    Returns "done" when this changed it, "already" when there was nothing to
+    do, or None when it cannot be done now (minimised, gone, refused).
+    """
+    GWL_STYLE = -16
+    GWL_EXSTYLE = -20
+    SW_RESTORE = 9
+    SWP_NOZORDER = 0x0004
+    SWP_NOOWNERZORDER = 0x0200
+    SWP_FRAMECHANGED = 0x0020
+    SWP_SHOWWINDOW = 0x0040
+
+    user32 = _user32_for_borderless()
+    if not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
+        return None
+    style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
+    ex_style = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+    monitor = windows_monitor_rect(hwnd)
+    rect = windows_window_rect(hwnd)
+    if monitor is None or rect is None:
+        return None
+    if is_borderless(style, ex_style, rect, monitor):
+        return "already"
+    if user32.IsZoomed(hwnd):
+        # A maximised window keeps its maximised size on top of whatever is
+        # set below, and snaps back to it later.
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    new_style, new_ex = borderless_style(style, ex_style)
+    user32.SetWindowLongPtrW(hwnd, GWL_STYLE, new_style)
+    user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex)
+    left, top, right, bottom = monitor
+    user32.SetWindowPos(hwnd, None, left, top, right - left, bottom - top,
+                        SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED
+                        | SWP_SHOWWINDOW)
+    after = windows_window_rect(hwnd)
+    style = user32.GetWindowLongPtrW(hwnd, GWL_STYLE)
+    ex_style = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+    if after is not None and is_borderless(style, ex_style, after, monitor):
+        return "done"
+    return None
+
+
+def _window_area(hwnd):
+    rect = windows_window_rect(hwnd)
+    if rect is None:
+        return 0
+    return max(0, rect[2] - rect[0]) * max(0, rect[3] - rect[1])
+
+
+def keep_the_game_borderless(proc, poll=BORDERLESS_POLL_SECONDS,
+                             settle=BORDERLESS_SETTLE_SECONDS,
+                             make=None, find=None):
+    """Hold the game's window borderless until the game exits.
+
+    Never raises and never blocks the game. `make` and `find` are seams for a
+    test; the real ones call Windows.
+    """
+    if make is None:
+        make = windows_make_borderless
+    if find is None:
+        def find():
+            pids = process_tree(proc.pid, windows_process_parents())
+            return choose_game_window(windows_top_level_windows(), pids,
+                                      _window_area)
+    if make is windows_make_borderless:
+        try:
+            windows_dpi_aware()
+        except Exception as exc:
+            log("borderless: could not ask for real pixels (%s)" % exc)
+    time.sleep(settle)
+    fixed = {}
+    while proc.poll() is None:
+        try:
+            target = find()
+            if target:
+                result = make(target)
+                if result == "done":
+                    fixed[target] = fixed.get(target, 0) + 1
+                    if fixed[target] == 1:
+                        log("borderless: took the frame off the game's window")
+                    elif fixed[target] in (2, 10, 100):
+                        log("borderless: the game put its frame back; "
+                            "taken off again (%d times)" % fixed[target])
+        except Exception as exc:
+            log("borderless: gave up (%s)" % exc)
+            return False
+        time.sleep(poll)
+    return bool(fixed)
+
+
+def watch_to_keep_borderless(proc):
+    """Run keep_the_game_borderless beside the game, when it was asked for."""
+    if not BORDERLESS:
+        return None
+    if not is_windows():
+        log("borderless: nothing to do here; this is for Windows only")
+        return None
+    if not getattr(proc, "pid", None):
+        return None
+    thread = threading.Thread(target=keep_the_game_borderless, args=(proc,),
+                              daemon=True)
+    thread.start()
+    return thread
 
 
 def launch(command, do_restore=False):
@@ -2452,6 +3425,8 @@ def launch(command, do_restore=False):
         log("the game failed to start: %s" % exc)
         return GAME_FAILED_TO_START
     CHILD = proc
+    watch_for_the_game_window(proc)
+    watch_to_keep_borderless(proc)
     try:
         code = wait_for_child(proc)
     finally:
@@ -2522,6 +3497,13 @@ def split_command(argv):
     return argv[argv.index("--") + 1:]
 
 
+def head_of(argv):
+    """The switches before `--`. What comes after is the game's own."""
+    if "--" not in argv:
+        return list(argv)
+    return argv[:argv.index("--")]
+
+
 def tree_name(argv):
     """The save set named by --tree, or None for the single game path.
 
@@ -2579,6 +3561,602 @@ def trace_signals():
                 signal.signal(sig, handler)
             except (ValueError, OSError):
                 pass
+
+
+# ---------------------------------------------------------------- store mode
+#
+# docs/superpowers/specs/2026-09-24-store-and-daemon-design.md. When
+# savepick.json has a "store" section, saves go to the store through the
+# daemon (slotd.py beside this file) and Syncthing is not asked anything.
+# A save set (--tree) goes to the store too, merged file by file.
+
+STORE_EXIT_NOTE_SECONDS = 1.2
+
+
+def store_settings():
+    return load_config().get("store") or None
+
+
+def store_worker():
+    """(worker, store name) from slotd.connect, or (None, reason)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import slotd
+        import slotstore
+    except ImportError as exc:
+        return None, "slotd.py is missing beside savepick.py (%s)" % exc
+    worker, how = slotd.connect(config_path=str(config_path()), log=log)
+    if worker is None:
+        return None, how
+    log("store: using the %s worker" % how)
+    return worker, slotstore.store_name(store_settings())
+
+
+def hash_files(paths):
+    """SHA-256 of each save file. What "the same save" means across devices."""
+    import hashlib
+    out = set()
+    for path in paths:
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            continue
+        out.add(digest.hexdigest())
+    return out
+
+
+def restored_hashes(backup_dir):
+    """The save hashes inside a fetched backup, without ludusavi's metadata."""
+    paths = []
+    for folder, _dirs, files in os.walk(str(backup_dir)):
+        for name in files:
+            if name not in METADATA_NAMES:
+                paths.append(os.path.join(folder, name))
+    return hash_files(paths)
+
+
+def when_text(iso_text):
+    if not iso_text:
+        return "unknown"
+    try:
+        stamp = datetime.strptime(iso_text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return iso_text
+    return human_time(stamp)
+
+
+def played_end_ts(choice):
+    text = choice.get("played_end") or choice.get("created")
+    try:
+        return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+class KeepAwake(object):
+    """Ask the OS not to sleep while a save uploads.
+
+    Windows honours ES_SYSTEM_REQUIRED against idle sleep. A lid or a power
+    button still wins; logind's delay inhibitor buys a few seconds on Linux.
+    Either way the queue is on disk, so a cut-off upload carries on at wake.
+    """
+
+    def __init__(self):
+        self.proc = None
+        self.windows = False
+
+    def __enter__(self):
+        try:
+            if is_windows():
+                import ctypes
+                ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+                ctypes.windll.kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+                self.windows = True
+            elif shutil.which("systemd-inhibit"):
+                self.proc = subprocess.Popen(
+                    ["systemd-inhibit", "--what=sleep", "--mode=delay",
+                     "--who=BlockSlot", "--why=Uploading a save", "sleep", "600"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            log("keep awake: %s" % exc)
+        return self
+
+    def __exit__(self, *_exc):
+        try:
+            if self.windows:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+            if self.proc is not None:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+        except Exception as exc:
+            log("keep awake release: %s" % exc)
+        return False
+
+
+def handoff_dir(prefix):
+    """A temp folder the Blockslot service writes into and this user reads.
+
+    Not tempfile.mkdtemp: since Python 3.12.4 its folders on Windows get an
+    ACL of SYSTEM, Administrators and OWNER RIGHTS only. A file the service
+    (LocalSystem) writes there is owned by SYSTEM, so ludusavi, running from
+    Steam with an ordinary token, cannot read it and restores nothing. That
+    is what happened to DS2 on 2026-09-25. A plain makedirs inherits the
+    Temp folder's ACL, which names this user.
+    """
+    import secrets
+    path = os.path.join(tempfile.gettempdir(), "%s%s" % (prefix, secrets.token_hex(6)))
+    os.makedirs(path)
+    return path
+
+
+def store_restore(worker, game, choice, live_paths):
+    """Fetch one snapshot and restore it. True when the save itself landed."""
+    if live_paths and not snapshot_live_saves(game, live_paths):
+        log("store: no vault snapshot, so no restore")
+        return False
+    where = handoff_dir("blockslot-restore-")
+    try:
+        worker.fetch(game, choice["id"], where)
+        wanted = restored_hashes(where)
+        args = ["--no-manifest-update", "restore", "--force", "--api",
+                "--path", where, game]
+        ok = False
+        for attempt in (1, 2):
+            log("restoring (attempt %d): %s" % (attempt, " ".join(args)))
+            log_restore_answer(game, run_json(args, timeout=RESTORE_TIMEOUT_SECONDS))
+            live = live_save_files(game)
+            landed = hash_files(live)
+            ok = bool(wanted) and wanted <= landed
+            if ok:
+                break
+            # Say exactly what is on disk, so the next failure explains
+            # itself. On 2026-09-25 a restore inside a Steam launch wrote
+            # nothing, the same one run by hand worked, and nothing said why.
+            for path in live:
+                try:
+                    stat = os.stat(path)
+                    log("store: live %s is %s, written %s"
+                        % (path, sorted(hash_files([path]))[0][:12], human_time(stat.st_mtime)))
+                except (OSError, IndexError):
+                    log("store: live %s cannot be read" % path)
+            log("store: wanted %s" % ", ".join(sorted(h[:12] for h in wanted)))
+            time.sleep(2)
+        log("store: the save %s" % ("landed" if ok else "did NOT land"))
+        if ok:
+            worker.set_base(game, choice["id"])
+        return ok
+    except Exception as exc:
+        log("store: restore failed: %s" % exc)
+        return False
+    finally:
+        shutil.rmtree(where, ignore_errors=True)
+
+
+def log_restore_answer(game, data):
+    """ludusavi's own account of a restore, file by file, into the log."""
+    if data is None:
+        log("restore: ludusavi gave no readable answer")
+        return
+    entry = (data.get("games") or {}).get(game) or {}
+    log("restore: ludusavi says %s / %s" % (entry.get("decision"), entry.get("change")))
+    for path, info in (entry.get("files") or {}).items():
+        log("restore: %s %s%s" % (info.get("change"), path,
+                                  (" FAILED: %s" % info.get("error")) if info.get("failed") else ""))
+
+
+def store_before_launch(worker, name, game):
+    """Everything before the game starts. Never raises; never blocks for long."""
+    spinner = Spinner(APP_TITLE, "Checking %s ..." % name)
+    try:
+        live_paths = live_save_files(game)
+        answer = worker.decide(game, sorted(hash_files(live_paths)))
+    except Exception as exc:
+        answer = {"action": "unknown", "error": str(exc)}
+    finally:
+        spinner.close()
+    action = answer.get("action")
+    log("store: %s -> %s" % (game, action))
+
+    if action == "unknown":
+        show_warning(APP_TITLE,
+                     "Could not check %s.\n\n%s\n\n"
+                     "%s starts on the save that is on this device. If you\n"
+                     "played somewhere else since, quit now and let it sync."
+                     % (name, answer.get("error") or "", game))
+        return
+    if action == "launch":
+        if answer.get("adopt"):
+            worker.set_base(game, answer["adopt"])
+        return
+    if action == "restore":
+        choice = answer["restore"]
+        spinner = Spinner(APP_TITLE, "Getting your %s save for %s ..."
+                          % (choice.get("device"), game))
+        try:
+            landed = store_restore(worker, game, choice, live_paths)
+        finally:
+            spinner.close()
+        if not landed:
+            warn_restore_incomplete(game)
+        return
+    if action == "wait":
+        pending = answer.get("pending") or [{}]
+        who = pending[0].get("device") or "another device"
+        show_warning(APP_TITLE,
+                     "%s has a newer save of %s that it has not finished\n"
+                     "uploading.\n\n"
+                     "Playing here now starts from an older save. Quit, let\n"
+                     "%s finish, then start the game again."
+                     % (who, game, who))
+        return
+    if action == "ask":
+        choices = sorted(answer.get("choices") or [], key=lambda c: played_end_ts(c) or 0)
+        other = choices[-1] if choices else None
+        if other is None:
+            return
+        live_mtime = newest_live_mtime(live_paths)
+        picked = ask_user(game, live_mtime, "%s save" % other.get("device"),
+                          played_end_ts(other),
+                          headline="These two saves are different, and both were played.",
+                          keep_label="Keep this device",
+                          restore_label="Use the %s save" % other.get("device"))
+        if picked is True:
+            spinner = Spinner(APP_TITLE, "Getting the %s save ..." % other.get("device"))
+            try:
+                worker.choose(game, other["id"])
+                landed = store_restore(worker, game, other, live_paths)
+            finally:
+                spinner.close()
+            if not landed:
+                warn_restore_incomplete(game)
+        else:
+            # Keeping this device is a decision too. The next save names every
+            # other head as a parent, so the fork closes when it uploads.
+            log("store: kept this device over %s" % other["id"])
+            losers = [c["id"] for c in choices]
+            worker.set_base(game, answer.get("base"), merge=losers)
+
+
+def store_after_exit(worker, name, game, played, mode="game", started_on=None):
+    """Back up, hand the save to the daemon, and say plainly where it is."""
+    where = tempfile.mkdtemp(prefix="blockslot-backup-")
+    try:
+        cmd = [ludusavi_binary(), "--no-manifest-update", "backup", "--force",
+               "--path", where, game]
+        log("exit backup: %s" % " ".join(cmd))
+        try:
+            done = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                                  stdin=subprocess.DEVNULL, **no_window())
+            failed = done.returncode != 0 or not os.listdir(where)
+        except (OSError, subprocess.SubprocessError) as exc:
+            failed, done = True, None
+            log("exit backup: %s" % exc)
+        if failed:
+            show_warning(APP_TITLE,
+                         "Backup FAILED\n\n%s\n\nYour save on this device is "
+                         "untouched, but it was not\nsaved for your other devices." % game)
+            return
+        if started_on is not None and restored_hashes(where) == started_on:
+            # The save is exactly what the game started on: nothing to send.
+            # On 2026-09-25 a 7 second launch uploaded an unchanged save with
+            # no parent and made a second DS2 head for no reason.
+            log("store: %s did not change this session; nothing to upload" % game)
+            return
+        staged = worker.stage(game, where, played=played, mode=mode)
+    finally:
+        shutil.rmtree(where, ignore_errors=True)
+
+    wait_for_upload(worker, name, game, staged["snap"])
+
+
+# ---------------------------------------------------------------- libraries
+#
+# An emulator's saves folder (a "tree" in savepick.json) is split into one
+# save per game by saveunits.py, and each game has its own history on the
+# store: restored when another device is newer, uploaded when it changed.
+# A tree with "one_game" set is a single game, such as Bloodborne in shadPS4.
+
+LIBRARY_LIST = 5
+
+
+def saveunits_module():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import saveunits
+    return saveunits
+
+
+def tree_setting(game, key, default=None):
+    return ((load_config().get("trees") or {}).get(game) or {}).get(key, default)
+
+
+def library_units(game, root):
+    """{unit name: {"unit": info, "rels": [...], "hashes": [...]}} on this device."""
+    import slotstore
+    su = saveunits_module()
+    allowed = tree_allowed(game)
+    always = tree_always_dirs(game)
+    aliases = tree_aliases(game)
+    index = index_tree(root)
+    rels = sorted(rel for rel in index if is_restorable(rel, allowed, always))
+    one_game = tree_setting(game, "one_game")
+    if one_game:
+        system = tree_setting(game, "system", "")
+        groups = {su.unit_id(system, one_game): rels} if rels else {}
+    else:
+        groups = su.split(rels, aliases)
+    out = {}
+    for unit_id, members in groups.items():
+        system, _sep, title = unit_id.partition("/")
+        system = "" if system == "content" else system
+        info = {"library": game, "id": unit_id, "title": su.display(system, title),
+                "system": system,
+                "label": tree_setting(game, "label") or su.label_for(system)}
+        out[slotstore.library_unit_name(game, unit_id)] = {
+            "unit": info, "rels": members,
+            "hashes": sorted(hash_files([str(Path(root) / rel) for rel in members]))}
+    return out
+
+
+def library_restore_items(files, root, local_index, game):
+    """Blob fetches that lay another device's copy of a game out here.
+
+    The same rules the per-file merge used: a system folder is renamed to
+    this device's alias, and a path whose layout this device does not use is
+    skipped rather than written where no emulator reads it.
+    """
+    aliases = tree_aliases(game)
+    allowed = tree_allowed(game)
+    tops = top_dirs(local_index) if aliases else set()
+    dirs = tree_dirs(local_index)
+    items, skipped = [], []
+    for record in files:
+        rel = record["path"]
+        target = alias_path(rel, aliases, tops) if aliases else rel
+        if target is None or (allowed is not None and target not in local_index
+                              and not path_fits(target, dirs)):
+            skipped.append(rel)
+            continue
+        items.append({"sha256": record["sha256"], "path": str(Path(root) / target),
+                      "mtime": record.get("mtime"), "rel": target})
+    return items, skipped
+
+
+def store_library_before_launch(worker, name, game, root):
+    """Every game in the library that is newer elsewhere comes here first."""
+    spinner = Spinner(APP_TITLE, "Checking %s ..." % name)
+    try:
+        units = library_units(game, root)
+        answer = worker.library(game, {unit: {"hashes": data["hashes"], "unit": data["unit"]["id"]}
+                                       for unit, data in units.items()})
+    except Exception as exc:
+        spinner.close()
+        log("library: store not readable: %s" % exc)
+        show_warning(APP_TITLE, "Could not check %s.\n\n%s\n\n%s starts on the saves "
+                     "on this device." % (name, exc, game))
+        return None
+    todo = answer.get("units") or {}
+    log("library %s: %d game(s) here, %d on the store, %d adopted, %d need something"
+        % (game, len(units), answer.get("store_units", 0), answer.get("adopted", 0), len(todo)))
+    local_index = index_tree(root)
+    restored, failed, asked, waiting = [], 0, [], []
+    single = bool(tree_setting(game, "one_game"))
+    try:
+        for unit_name, entry in sorted(todo.items()):
+            action = entry.get("action")
+            if action == "restore":
+                choice = entry["restore"]
+            elif action == "ask" and single:
+                choices = sorted(entry.get("choices") or [], key=lambda c: played_end_ts(c) or 0)
+                other = choices[-1]
+                spinner.close()
+                picked = ask_user(game, newest_live_mtime(
+                                      [str(Path(root) / r) for r in units.get(unit_name, {}).get("rels", [])]),
+                                  "%s save" % other.get("device"), played_end_ts(other),
+                                  headline="These two saves are different, and both were played.",
+                                  keep_label="Keep this device",
+                                  restore_label="Use the %s save" % other.get("device"))
+                spinner = Spinner(APP_TITLE, "Getting the %s save ..." % other.get("device"))
+                if picked is not True:
+                    worker.set_base(unit_name, None, merge=[c["id"] for c in choices])
+                    continue
+                worker.choose(unit_name, other["id"])
+                choice = other
+            elif action == "ask":
+                asked.append(((entry.get("choices") or [{}])[0].get("unit") or {}).get("title")
+                             or unit_name)
+                continue
+            elif action == "wait":
+                waiting.append(unit_name)
+                continue
+            else:
+                continue
+            items, skipped = library_restore_items(choice["files"], root, local_index, game)
+            for rel in skipped:
+                log("library: %s does not fit this device's layout; skipped" % rel)
+            replacing = [item["path"] for item in items if item["rel"] in local_index]
+            if replacing and not snapshot_live_saves(game, replacing):
+                log("library: no vault snapshot, so %s stays as it is" % unit_name)
+                failed += 1
+                continue
+            if items:
+                result = worker.fetch_blobs([{k: item[k] for k in ("sha256", "path", "mtime")}
+                                             for item in items])
+                for path, why in result.get("failed") or []:
+                    log("library: could not write %s: %s" % (path, why))
+                if result.get("failed"):
+                    failed += 1
+                    continue
+            # The base moves even when nothing fitted, so a game this device
+            # cannot use is not offered again at every launch.
+            worker.set_base(unit_name, choice["id"])
+            title = (choice.get("unit") or {}).get("title") or unit_name
+            if not items:
+                log("library: %s from %s uses a layout this device does not; "
+                    "nothing written" % (title, choice.get("device")))
+                continue
+            restored.append(title)
+            log("library: %s from %s" % (title, choice.get("device")))
+    except Exception as exc:
+        log("library: restore failed: %s" % exc)
+        failed += 1
+    finally:
+        spinner.close()
+    log("library %s: %d restored, %d failed, %d with two saves, %d still uploading elsewhere"
+        % (game, len(restored), failed, len(asked), len(waiting)))
+    if failed:
+        warn_restore_incomplete(game)
+    notes = []
+    if asked:
+        notes.append("%d game%s have a different save on another device, and both "
+                     "were played:\n  %s\nThis device's saves were kept. Choose in "
+                     "BlockSlot." % (len(asked), "" if len(asked) == 1 else "s",
+                                     "\n  ".join(sorted(asked)[:LIBRARY_LIST])))
+    if waiting:
+        notes.append("%d game%s have a newer save another device is still uploading."
+                     % (len(waiting), "" if len(waiting) == 1 else "s"))
+    if notes:
+        show_warning(APP_TITLE, "%s\n\n%s" % (game, "\n\n".join(notes)))
+    return {"new_here": set(answer.get("new_here") or [])}
+
+
+def store_library_after_exit(worker, name, game, root, before, played):
+    """Upload every game in the library whose save changed, and only those."""
+    after = library_units(game, root)
+    changed = [unit for unit, data in after.items()
+               if data["hashes"] != (before.get(unit) or {}).get("hashes")
+               or unit in (before.get("__new_here__") or set())]
+    log("library %s: %d game(s) changed this session" % (game, len(changed)))
+    if not changed:
+        return
+    last = None
+    for unit in changed:
+        where = tempfile.mkdtemp(prefix="blockslot-unit-")
+        try:
+            for rel in after[unit]["rels"]:
+                target = Path(where) / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(Path(root) / rel), str(target))
+            last = worker.stage(unit, where, played=played, mode="library",
+                                unit=after[unit]["unit"])["snap"]
+        finally:
+            shutil.rmtree(where, ignore_errors=True)
+    wait_for_upload(worker, name, game, last)
+
+
+def wait_for_upload(worker, name, game, snap):
+    """The exit wait and its messages, shared by games and libraries."""
+    spinner = Spinner(APP_TITLE, "Saving to %s ...\nB or Cancel finishes in the background."
+                      % name, cancellable=True)
+    cancel = SpinnerOrPadCancel(spinner)
+    result = {"state": "uploading"}
+    try:
+        with KeepAwake():
+            while True:
+                result = worker.wait(snap, 2)
+                if result.get("state") != "uploading":
+                    break
+                total = result.get("total") or 0
+                if total:
+                    spinner.update("Saving to %s ... %s of %s\n"
+                                   "B or Cancel finishes in the background."
+                                   % (name, human_bytes(result.get("done") or 0),
+                                      human_bytes(total)),
+                                   int(100 * (result.get("done") or 0) / total))
+                if cancel.pressed():
+                    log("store: left the upload to the daemon")
+                    break
+            if result.get("state") == "committed":
+                spinner.update("Saved to %s." % name, 100)
+                time.sleep(STORE_EXIT_NOTE_SECONDS)
+    except Exception as exc:
+        result = {"state": "offline", "message": str(exc)}
+    finally:
+        cancel.close()
+        spinner.close()
+    state = result.get("state")
+    log("store: exit upload %s (%s)" % (state, result.get("message") or snap))
+    if state == "offline":
+        show_warning(APP_TITLE,
+                     "NOT UPLOADED YET\n\n"
+                     "%s is saved on this device, but %s could not be\n"
+                     "reached.\n\n"
+                     "It will upload by itself when this device is online.\n"
+                     "Until then, do not play it on another device." % (game, name))
+    elif state == "refused":
+        show_warning(APP_TITLE,
+                     "NOT UPLOADED\n\n%s refused the save:\n%s\n\n"
+                     "%s is saved on this device and stays queued.\n"
+                     "Fix the store settings and it will upload."
+                     % (name, result.get("message") or "", game))
+    elif state == "uploading":
+        show_warning(APP_TITLE,
+                     "Still uploading %s to %s.\n\n"
+                     "It carries on in the background. Keep this device\n"
+                     "awake and online until it finishes." % (game, name))
+
+
+def main_store_library(game, command):
+    worker, name = store_worker()
+    if worker is None:
+        log("store: %s; launching without a restore" % name)
+        show_warning(APP_TITLE, "The save store is not working:\n%s\n\n"
+                     "%s starts on the saves on this device." % (name, game))
+        return launch(command)
+    me = None
+    try:
+        import slotd
+        _settings, me = slotd.load_settings(str(config_path()))
+    except Exception as exc:
+        log("library: cannot read the device name: %s" % exc)
+    root_text = tree_roots(game).get(me or "")
+    if not root_text:
+        log("library: no root for %s on %s; launching without a restore" % (game, me))
+        return launch(command)
+    root = Path(root_text)
+    answer = store_library_before_launch(worker, name, game, root)
+    before = library_units(game, root)
+    before["__new_here__"] = (answer or {}).get("new_here") or set()
+    started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    code = launch(command)
+    played = {"start": started,
+              "end": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    try:
+        store_library_after_exit(worker, name, game, root, before, played)
+    except Exception as exc:
+        log("store: exit step failed: %s" % exc)
+    return code
+
+
+def main_store(game, command):
+    worker, name = store_worker()
+    if worker is None:
+        log("store: %s; launching without a restore" % name)
+        show_warning(APP_TITLE, "The save store is not working:\n%s\n\n"
+                     "%s starts on the save on this device." % (name, game))
+        return launch(command)
+    store_before_launch(worker, name, game)
+    try:
+        started_on = hash_files(live_save_files(game))
+    except Exception as exc:
+        log("store: cannot read the save the game starts on: %s" % exc)
+        started_on = None
+    started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    code = launch(command)
+    played = {"start": started,
+              "end": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    try:
+        store_after_exit(worker, name, game, played, started_on=started_on)
+    except Exception as exc:
+        log("store: exit step failed: %s" % exc)
+    return code
 
 
 def main_tree(game, command, dry_run=False):
@@ -2640,6 +4218,7 @@ def main_tree(game, command, dry_run=False):
 
 
 def main(argv):
+    global BORDERLESS
     hide_own_console()
     trace_signals()
     command = split_command(argv)
@@ -2647,8 +4226,18 @@ def main(argv):
         log("no game command given after --; nothing to launch")
         return 2
 
+    head = head_of(argv)
+    BORDERLESS = "--borderless" in head
+    if "--no-sync" in head:
+        # Borderless only. No Syncthing, no ludusavi, no save touched, and no
+        # window before the game: it starts at once.
+        log("no-sync: launching without touching saves")
+        return launch(command)
+
     game = tree_name(argv)
     if game:
+        if store_settings():
+            return main_store_library(game, command)
         return main_tree(game, command, dry_run="--dry-run" in argv)
 
     appid = os.environ.get("SteamAppId") or os.environ.get("SteamGameId")
@@ -2660,6 +4249,9 @@ def main(argv):
     if not game:
         log("ludusavi does not recognise steam id %s; launching without a restore" % appid)
         return launch(command, do_restore=False)
+
+    if store_settings():
+        return main_store(game, command)
 
     synced = confirm_incoming_sync()
     cfg = sync_settings()

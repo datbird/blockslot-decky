@@ -1,7 +1,7 @@
 # Third party notices
 
-Blockslot uses the following third party work. Their licences are reproduced in
-full below, as those licences require.
+Blockslot uses the following third party work. Their licenses are reproduced in
+full below, as those licenses require.
 
 ## ludusavi and ludusavi-manifest
 
@@ -13,7 +13,7 @@ game index from `ludusavi-manifest`.
 
 Blockslot does not contain or redistribute the ludusavi program. The Decky
 plugin names the official v0.31.0 release as a download, and each device
-fetches it from ludusavi's own release page. The licences of everything
+fetches it from ludusavi's own release page. The licenses of everything
 compiled into that program are published beside it, as
 `ludusavi-v0.31.0-legal.zip`:
 
@@ -55,13 +55,27 @@ original data is unmodified in substance.
 [PCGamingWiki](https://www.pcgamingwiki.com), whose content is licensed
 [CC BY-NC-SA 3.0](https://creativecommons.org/licenses/by-nc-sa/3.0).
 
-Blockslot takes that data through `ludusavi-manifest` under its MIT licence and
+Blockslot takes that data through `ludusavi-manifest` under its MIT license and
 does not claim rights over the underlying facts. This credit is not required by
 MIT. It is here because the save file locations in that wiki were found and
 recorded by people, one game at a time, and that work deserves naming.
 
+## Garage
+
+The BlockSlot server image (`blockslot-server`) includes
+[Garage](https://garagehq.deuxfleurs.fr), the S3 store the saves live in,
+copied unmodified from the official `dxflrs/garage` image. Garage is
+Copyright Deuxfleurs and its contributors, licensed under the
+[GNU Affero General Public License v3.0](https://git.deuxfleurs.fr/Deuxfleurs/garage/src/branch/main/LICENSE).
+Its source code, for the exact version in the image (named by
+`GARAGE_VERSION` in `server/Dockerfile`), is at
+<https://git.deuxfleurs.fr/Deuxfleurs/garage>. BlockSlot runs Garage as a
+separate program and talks to it only over its S3 and admin HTTP APIs;
+BlockSlot's own code stays under the MIT license.
+
 ## Syncthing
 
-Blockslot requires [Syncthing](https://syncthing.net/) to move files between
-devices. Blockslot does not bundle or modify it. Syncthing is licensed
+Older BlockSlot setups moved files with [Syncthing](https://syncthing.net/),
+and the Syncthing screens remain for them. BlockSlot does not bundle or modify
+it. Syncthing is licensed
 [MPL-2.0](https://github.com/syncthing/syncthing/blob/main/LICENSE).

@@ -94,14 +94,64 @@ def cache_path(name):
 
 
 def log_path():
-    """The engine's log, which the GUI only ever reads."""
+    """The engine's log, which the GUI only ever reads (savepick._log_path)."""
     import tempfile
-    return Path(tempfile.gettempdir()) / "savepick.log"
+    if is_windows():
+        return Path(tempfile.gettempdir()) / "savepick.log"
+    base = os.environ.get("XDG_STATE_HOME") or str(home() / ".local" / "state")
+    return Path(base) / "blockslot" / "savepick.log"
 
 
 def ludusavi_path():
     name = "ludusavi.exe" if is_windows() else "ludusavi"
     return bin_dir() / name
+
+
+def engine_in_exe():
+    """True when Blockslot.exe carries the engine and a launch option runs it.
+
+    Only the frozen Windows build does this. Everywhere else, and from a git
+    checkout on Windows, a wrap names python and the deployed savepick.py, as
+    it always has: the Deck and the Mac have python, and a Windows PC with
+    the exe may have none, so there the exe itself is the engine's host.
+    """
+    return is_frozen() and is_windows()
+
+
+def launch_program():
+    """The program a Windows wrap names when the exe hosts the engine."""
+    return Path(sys.executable)
+
+
+def in_temporary_place(program=None):
+    """True when `program` (the running exe) sits somewhere that will vanish.
+
+    A launch option names the exe by its full path. Run from %TEMP%, or from
+    the folder Explorer unpacks a zip into when you open the exe without
+    extracting it first, every game turned on would point at a file that is
+    gone after the next cleanup, and those games would stop starting.
+    """
+    import tempfile
+    program = Path(program or sys.executable)
+    try:
+        where = program.resolve()
+    except OSError:
+        where = program
+    folders = [part.lower() for part in where.parts[:-1]]
+    if any(part.endswith(".zip") for part in folders):
+        return True
+    temps = {os.environ.get("TEMP"), os.environ.get("TMP"),
+             tempfile.gettempdir()}
+    for temp in temps:
+        if not temp:
+            continue
+        try:
+            base = Path(temp).resolve()
+        except OSError:
+            base = Path(temp)
+        if str(where).lower().startswith(str(base).lower() + os.sep):
+            return True
+    return False
 
 
 def python_for_launch():

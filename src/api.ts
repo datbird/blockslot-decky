@@ -9,6 +9,8 @@ export interface Game {
   saves: boolean | null;
   on: boolean;
   set: string | null;
+  /** "library: <name>" or "game: <one game>", for a game tied to a tree. */
+  set_caption?: string;
   shortcut: boolean;
   hub: string;
   hub_device: string;
@@ -25,10 +27,48 @@ export interface LogLine {
   kind: "bad" | "warn" | "good" | "";
 }
 
+/**
+ * One tree of savepick.json: an emulator library (many games, each its own
+ * save) or, with `one_game`, one emulator game. `label` names the emulator
+ * that owns the save, never the frontend.
+ */
 export interface SaveSet {
   name: string;
   root: string;
   devices: number;
+  kind?: "library" | "game";
+  one_game?: string;
+  label?: string;
+}
+
+/** One save of a game two devices both played. `id` goes to storeChoose. */
+export interface GameChoice {
+  id: string;
+  device: string;
+  when: string;
+}
+
+/** One game of an emulator library, as library_games hands it out. */
+export interface LibraryGame {
+  name: string;
+  title: string;
+  system: string;
+  label: string;
+  when: string;
+  device: string;
+  line: string;
+  two: boolean;
+  heads: number;
+  /** Null when the store did not say which saves they are. */
+  choices: GameChoice[] | null;
+}
+
+export interface LibraryGames {
+  library: string;
+  games: LibraryGame[];
+  total: number;
+  all: number;
+  error: string | null;
 }
 
 export interface SyncSettings {
@@ -141,3 +181,67 @@ export async function setSync(
   }
   return {};
 }
+
+// ------------------------------------------------------------------ store
+
+/** One snapshot waiting in this device's queue. */
+export interface QueuedSave {
+  id: string;
+  game: string;
+  bytes: number;
+  progress: { done: number; total: number } | null;
+}
+
+/**
+ * What the store daemon says. `configured` false means savepick.json has no
+ * store section, and the panel then shows nothing about a store at all.
+ */
+export interface StoreStatus {
+  configured: boolean;
+  running?: boolean;
+  store?: string;
+  device?: string;
+  queue?: QueuedSave[];
+  error?: { kind: string; message: string } | null;
+  last_ok?: string | null;
+  line?: string;
+  tone?: "good" | "warn" | "bad";
+}
+
+/** One head of a forked game: a real save from one device. */
+export interface ForkHead {
+  id: string;
+  device: string;
+  created: string | null;
+  played_end: string | null;
+}
+
+export interface Fork {
+  game: string;
+  label: string;
+  heads: ForkHead[];
+}
+
+export const storeStatus = () => call<StoreStatus>("store_status");
+
+/** Set this device up from a BlockSlot server's pairing code. */
+export const storePair = (address: string, code: string) =>
+  call<{ ok: boolean; error?: string; status?: StoreStatus; address?: string }>(
+    "store_pair", address, code);
+
+export const storeUploadNow = () =>
+  call<{ ok: boolean; error?: string }>("store_upload_now");
+
+export const storeForks = () =>
+  call<{ forks: Fork[]; error: string | null }>("store_forks");
+
+export const storeChoose = (game: string, snapId: string) =>
+  call<{ ok: boolean; error?: string; merge?: string }>("store_choose", game, snapId);
+
+/** At most `limit` games of one library, filtered by title. */
+export const libraryGames = (
+  library: string,
+  search: string,
+  limit = 200,
+  refresh = false
+) => call<LibraryGames>("library_games", library, search, limit, refresh);

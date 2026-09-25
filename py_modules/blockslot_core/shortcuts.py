@@ -17,7 +17,7 @@ import os
 import shutil
 from pathlib import Path
 
-from . import vdf
+from . import vdf, wrap
 
 ROOT_KEY = "shortcuts"
 
@@ -204,13 +204,18 @@ def find_own(entries, entry_point=None):
 
     The program is matched by its file name, not by a word anywhere in the
     path: a game kept in a folder called blockslot is not ours.
+
+    A game wrapped by the Windows exe also names Blockslot.exe, with
+    `--pick ... -- <game>` as its options. That is the game's entry, not
+    Blockslot's, so a wrapped entry is never counted as our own.
     """
     programs = set(OWN_PROGRAMS)
     if entry_point is not None:
         programs.add(_file_name(entry_point))
     return [entry for entry in entries
-            if OWN_SCRIPT in (entry.launch_options or "").lower()
-            or _file_name(entry.exe) in programs]
+            if not wrap.is_wrapped(entry.launch_options or "")
+            and (OWN_SCRIPT in (entry.launch_options or "").lower()
+                 or _file_name(entry.exe) in programs)]
 
 
 def _file_name(path):

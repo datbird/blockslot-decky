@@ -9,15 +9,56 @@ file carries tree definitions that were built by hand over weeks; a partial
 write would be expensive to notice and worse to recover.
 """
 
+import importlib
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from . import paths
 
 # The keys the engine insists on before it will trust the syncthing block.
 SYNC_REQUIRED = ("url", "apikey", "folder", "device_dir")
+
+# What each kind of store cannot work without (slotstore.store_from_settings).
+STORE_REQUIRED = {
+    "s3": ("endpoint", "bucket", "access_key", "secret_key"),
+    "ssh": ("host", "root"),
+    "local": ("root",),
+}
+
+# Every field that belongs to one kind of store, so that switching kinds can
+# drop the old kind's fields instead of leaving a stale key in the file.
+STORE_FIELDS = {
+    "s3": ("endpoint", "bucket", "region", "access_key", "secret_key"),
+    "ssh": ("host", "user", "port", "root", "identity"),
+    "local": ("root",),
+}
+
+# Written sealed with DPAPI on Windows. Elsewhere the file itself is 0600.
+STORE_SECRETS = ("secret_key", "cf_client_secret")
+
+
+def engine_module(name):
+    """Import slotd or slotstore from the engine that ships with Blockslot.
+
+    They are not a package: savepick imports them from its own folder, and the
+    exe carries them under "engine". So the folder is found the same way the
+    engine itself is found, the bundle first and then the source tree, with the
+    installed copy beside savepick as the last resort.
+    """
+    if name in sys.modules:
+        return sys.modules[name]
+    found = paths.resource("engine/%s.py" % name)
+    folder = found.parent if found else None
+    if folder is None and (paths.bin_dir() / (name + ".py")).is_file():
+        folder = paths.bin_dir()
+    if folder is None:
+        raise ImportError("BlockSlot cannot find engine/%s.py" % name)
+    if str(folder) not in sys.path:
+        sys.path.append(str(folder))
+    return importlib.import_module(name)
 
 DEFAULTS = {
     "syncthing": {
@@ -66,12 +107,31 @@ class Settings(object):
             except OSError:
                 pass
         temp = str(target) + ".tmp"
-        with open(temp, "w", encoding="utf-8") as handle:
+        private = not paths.is_windows()
+        if private:
+            # The store section holds keys in plain text off Windows, so the
+            # file is this user's alone, and so is the temporary copy it is
+            # written through. Made private at creation, not after, so there
+            # is no moment when another user could read it.
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        else:
+            handle = open(temp, "w", encoding="utf-8")
+        with handle:
             json.dump(self.data, handle, indent=2, sort_keys=False)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if private:
+            os.chmod(temp, 0o600)
         os.replace(temp, str(target))
+        if private:
+            backup = str(target) + ".blockslot.bak"
+            if os.path.isfile(backup):
+                try:
+                    os.chmod(backup, 0o600)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------ syncthing
 
@@ -118,6 +178,71 @@ class Settings(object):
             names.pop(dirname, None)
         self.set_sync(device_names=names)
 
+    # ------------------------------------------------------------ store
+
+    def store(self):
+        """The "store" section as written: secrets still sealed."""
+        block = self.data.get("store")
+        return dict(block) if isinstance(block, dict) else {}
+
+    def store_type(self):
+        return (self.store().get("type") or "").lower()
+
+    def set_store(self, **values):
+        """Merge values into the store section. None or "" removes a key.
+
+        A secret is sealed on the way in, so a plain key never reaches the
+        file on Windows. One that is already sealed is left as it is.
+        """
+        block = self.store()
+        for key, value in values.items():
+            if value is None or value == "":
+                block.pop(key, None)
+                continue
+            if key in STORE_SECRETS and not str(value).startswith("dpapi:"):
+                # With the Windows service installed, LocalSystem must be able
+                # to open it too, so it is sealed for the machine.
+                value = engine_module("slotd").protect(
+                    str(value), machine=bool(self.store().get("service")))
+            block[key] = value
+        self.data["store"] = block
+
+    def clear_store(self):
+        self.data.pop("store", None)
+
+    def missing_store_keys(self):
+        block = self.store()
+        kind = self.store_type()
+        if kind not in STORE_REQUIRED:
+            return ["type"]
+        return [key for key in STORE_REQUIRED[kind] if not block.get(key)]
+
+    def store_is_complete(self):
+        return not self.missing_store_keys()
+
+    def has_secret(self, key):
+        return bool(self.store().get(key))
+
+    def store_for_engine(self):
+        """The store section with its secrets opened, as slotstore wants it.
+
+        Raises slotstore.StoreRefused when a secret was sealed for another
+        Windows user or on another machine, which is a thing a person has to
+        fix by typing the secret again.
+        """
+        block = self.store()
+        slotd = engine_module("slotd")
+        for key in STORE_SECRETS:
+            if isinstance(block.get(key), str):
+                block[key] = slotd.unprotect(block[key])
+        return block
+
+    def store_device(self):
+        """This device's name on the store, as the daemon will use it."""
+        import socket
+        return self.store().get("device") or self.data.get("device") \
+            or socket.gethostname()
+
     # ------------------------------------------------------------ trees
 
     @property
@@ -142,14 +267,24 @@ class Settings(object):
         trees.pop(name, None)
         self.data["trees"] = trees
 
-    def add_tree(self, name, every_file=False):
-        """A new save set with no folders yet. ValueError says why not."""
+    def add_tree(self, name, every_file=False, one_game=None, system=None, label=None):
+        """A new emulator library, or one emulator game, with no folders yet.
+
+        ValueError says why not. `one_game` makes it a single game (Bloodborne
+        in shadPS4); otherwise the folder is split into one save per game.
+        """
         name = (name or "").strip()
         if not name:
-            raise ValueError("A save set needs a name.")
+            raise ValueError("An emulator library or game needs a name.")
         if name in self.trees:
-            raise ValueError("There is already a save set called %s." % name)
+            raise ValueError("There is already one called %s." % name)
         definition = {"roots": {}}
+        if one_game:
+            definition.update({"one_game": one_game, "extensions": "*"})
+            if system:
+                definition["system"] = system
+            if label:
+                definition["label"] = label
         if every_file:
             # One game's own folder: a console save often has no extension at
             # all, and an allow list would refuse every file in it.

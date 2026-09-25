@@ -22,7 +22,13 @@ import {
 import { useEffect, useState, FC } from "react";
 
 import { call, Game, Step } from "./api";
-import { BlockslotPage, GameRows, loadWithHub, useSyncToggle } from "./pages";
+import {
+  BlockslotPage,
+  GameRows,
+  loadWithHub,
+  StoreSection,
+  useSyncToggle,
+} from "./pages";
 
 const ROUTE = "/blockslot";
 
@@ -59,7 +65,7 @@ const Panel: FC = () => {
 
   return (
     <>
-      <PanelSection title={device ? "This device: " + device : "Blockslot"}>
+      <PanelSection title={device ? "This device: " + device : "BlockSlot"}>
         {busy ? (
           <PanelSectionRow>
             <Field label={busy} />
@@ -83,7 +89,7 @@ const Panel: FC = () => {
               Navigation.Navigate(ROUTE);
             }}
           >
-            Open Blockslot
+            Open BlockSlot
           </ButtonItem>
         </PanelSectionRow>
         {note ? (
@@ -92,6 +98,8 @@ const Panel: FC = () => {
           </PanelSectionRow>
         ) : null}
       </PanelSection>
+
+      <StoreSection />
 
       <PanelSection title="Games Steam Cloud does not cover">
         <GameRows games={games} busy={busy} flip={flip} />
@@ -104,7 +112,7 @@ export default definePlugin(() => {
   routerHook.addRoute(ROUTE, BlockslotPage, { exact: false });
   return {
     name: "Blockslot",
-    titleView: <div className={staticClasses.Title}>Blockslot</div>,
+    titleView: <div className={staticClasses.Title}>BlockSlot</div>,
     content: <Panel />,
     icon: <BlockslotIcon />,
     onDismount() {
@@ -113,12 +121,27 @@ export default definePlugin(() => {
   };
 });
 
-/** The same mark the desktop window uses: a block above a slot. */
+/** The Blockslot mark in one colour, as Steam draws every plugin icon: the
+ * cube between two sync arrows (assets/icon-small.svg), its three faces told
+ * apart by opacity instead of by colour. */
 function BlockslotIcon() {
   return (
-    <svg viewBox="0 0 32 32" width="1em" height="1em" fill="currentColor">
-      <rect x="11" y="5" width="10" height="7" rx="2" />
-      <path d="M4 16h24v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V16zm8 4h8a2 2 0 0 1 0 4h-8a2 2 0 0 1 0-4z" />
+    <svg viewBox="0 0 512 512" width="1em" height="1em" fill="currentColor">
+      <defs>
+        <marker id="blockslot-arrow" viewBox="0 0 10 10" refX="2" refY="5"
+          markerWidth="2.1" markerHeight="2.1" orient="auto">
+          <path d="M1 1 L9 5 L1 9 Z" fill="currentColor" />
+        </marker>
+      </defs>
+      <path d="M60 196 A206 206 0 0 1 428 150" fill="none" stroke="currentColor"
+        strokeWidth="44" markerEnd="url(#blockslot-arrow)" />
+      <path d="M452 316 A206 206 0 0 1 84 362" fill="none" stroke="currentColor"
+        strokeWidth="44" markerEnd="url(#blockslot-arrow)" />
+      <circle cx="60" cy="196" r="22" />
+      <circle cx="452" cy="316" r="22" />
+      <polygon points="256,120 376,190 256,260 136,190" />
+      <polygon points="136,190 256,260 256,400 136,330" opacity="0.7" />
+      <polygon points="256,260 376,190 376,330 256,400" opacity="0.45" />
     </svg>
   );
 }
